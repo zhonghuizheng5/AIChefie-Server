@@ -142,7 +142,28 @@ async function handleRequest(request, response) {
     }
 
     if (request.url === "/api/dish-image") {
-      sendJSON(response, 200, await generateDishImage(body));
+      const quota = checkImageQuota(request, body);
+      if (quota && quota.used >= quota.dailyLimit) {
+        sendJSON(response, 429, {
+          error: quota.tier === "premium"
+            ? "You have used today's 10 Premium pictures. More become available tomorrow."
+            : "Your free picture for today has been used. Upgrade to Premium or try again tomorrow.",
+          code: "image_quota_exceeded",
+          tier: quota.tier,
+          remainingToday: 0,
+          dailyLimit: quota.dailyLimit,
+        });
+        return;
+      }
+
+      const result = await generateDishImage(body);
+      if (quota && result.imageDataURL) {
+        const used = recordImageUse(quota);
+        result.tier = quota.tier;
+        result.dailyLimit = quota.dailyLimit;
+        result.remainingToday = Math.max(0, quota.dailyLimit - used);
+      }
+      sendJSON(response, 200, result);
       return;
     }
 
@@ -759,6 +780,66 @@ function recipeLogSummary(recipes) {
     pantrySeasoningsUsed: recipe.pantrySeasoningsUsed,
     steps: recipe.steps,
   }));
+}
+
+// Backup daily image quota. The app enforces the limit with a local counter;
+// this in-memory map catches clients that bypass or lose that counter. Counts
+// reset when the user's local calendar day changes (and on server restart,
+// which is acceptable for a backup).
+const FREE_DAILY_IMAGE_LIMIT = 1;
+const PREMIUM_DAILY_IMAGE_LIMIT = 10;
+const imageQuotaUsage = new Map();
+
+function checkImageQuota(request, body) {
+  const userKey = imageQuotaUserKey(request, body);
+  if (!userKey) {
+    return null;
+  }
+
+  const tier = cleanString(body?.tier) === "premium" ? "premium" : "free";
+  const dailyLimit = tier === "premium" ? PREMIUM_DAILY_IMAGE_LIMIT : FREE_DAILY_IMAGE_LIMIT;
+  const day = localDayKey(cleanString(body?.timeZone));
+  const entry = imageQuotaUsage.get(userKey);
+  const used = entry && entry.day === day ? entry.used : 0;
+  return { userKey, tier, dailyLimit, day, used };
+}
+
+function recordImageUse(quota) {
+  const used = quota.used + 1;
+  imageQuotaUsage.set(quota.userKey, { day: quota.day, used });
+  return used;
+}
+
+function imageQuotaUserKey(request, body) {
+  const authorization = cleanString(request.headers.authorization);
+  if (authorization && authorization.startsWith("Bearer ")) {
+    const uid = firebaseUserID(authorization.slice("Bearer ".length));
+    if (uid) {
+      return uid;
+    }
+  }
+  return cleanString(body?.quotaUserID) || null;
+}
+
+function firebaseUserID(token) {
+  try {
+    const payload = token.split(".")[1];
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return cleanString(decoded.user_id) || cleanString(decoded.sub) || null;
+  } catch {
+    return null;
+  }
+}
+
+function localDayKey(timeZone) {
+  const options = { year: "numeric", month: "2-digit", day: "2-digit" };
+  try {
+    return new Intl.DateTimeFormat("en-CA", { ...options, timeZone: timeZone || "UTC" })
+      .format(new Date());
+  } catch {
+    return new Intl.DateTimeFormat("en-CA", { ...options, timeZone: "UTC" })
+      .format(new Date());
+  }
 }
 
 async function generateDishImage(input) {
