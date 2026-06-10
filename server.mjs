@@ -62,6 +62,20 @@ const server = createServer((request, response) => {
     || randomUUID();
   response.setHeader("X-Request-ID", requestID);
 
+  // Absorb socket errors that fire when the iOS client disconnects mid-request
+  // (e.g. URLSession timeout). Without these handlers the unhandled EPIPE /
+  // ECONNRESET becomes an uncaught exception and crashes the process.
+  request.on("error", (err) => {
+    if (err.code !== "ECONNRESET") {
+      console.error("Request socket error:", { requestID, code: err.code });
+    }
+  });
+  response.on("error", (err) => {
+    if (err.code !== "EPIPE" && err.code !== "ECONNRESET") {
+      console.error("Response socket error:", { requestID, code: err.code });
+    }
+  });
+
   requestContext.run({ requestID }, () => {
     handleRequest(request, response).catch((error) => {
       console.error("CookLens request handler failed unexpectedly", {
@@ -196,10 +210,12 @@ async function handleRequest(request, response) {
 server.on("error", (error) => {
   if (error.code === "EADDRINUSE") {
     console.error(`Port ${config.port} is already in use. Stop the old CookLens server or use a different PORT.`);
+    process.exit(1);
   } else {
-    console.error(error);
+    // Log but don't exit — transient errors (ECONNRESET etc.) should not
+    // bring down the server and cause Railway to restart the process.
+    console.error("Server error:", { code: error.code, message: error.message });
   }
-  process.exit(1);
 });
 
 server.listen(config.port, () => {
