@@ -612,8 +612,8 @@ export function structuredRecipeViolations(
         recipe.structuredSteps,
         normalizeStringArray(recipe.steps)
       );
-      if (structuredSteps.length < 3 || structuredSteps.length > 8) {
-        violations.push(`Option ${index + 1} must contain 3 to 8 structured cooking steps`);
+      if (structuredSteps.length < 2 || structuredSteps.length > 8) {
+        violations.push(`Option ${index + 1} must contain 2 to 8 structured cooking steps`);
       }
       const heatingPattern = /\b(heat|cook|sear|simmer|boil|bake|roast|fry|saute|steam|grill|broil|reheat|warm)\b/i;
       for (const step of structuredSteps) {
@@ -771,7 +771,7 @@ export function buildRecipePrompt({
     "STRUCTURED STEPS:",
     "- Provide structuredSteps as the authoritative instructions, one entry per step in cooking order.",
     "- Each structuredSteps.instruction must be a complete, self-contained sentence that also reads correctly on its own.",
-    "- Return 3 to 8 structured steps. Do not combine preparation, cooking, and resting into one vague step.",
+    "- Return 2 to 8 structured steps. Simple dishes may use two complete steps; do not pad them with meaningless actions or combine preparation, cooking, and resting into one vague step.",
     "- Set heat to low, medium-low, medium, medium-high, or high whenever a burner is used. Use null when no burner heat is applied.",
     "- For an oven, air fryer, or similar appliance, set applianceTemperatureF and applianceTemperatureC. Do not place oven temperature text in heat.",
     "- Set minimumDurationSeconds to the shortest expected duration. Set maximumDurationSeconds when the user should check within a range. Use null for an untimed step.",

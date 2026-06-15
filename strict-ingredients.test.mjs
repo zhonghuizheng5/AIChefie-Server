@@ -935,3 +935,49 @@ test("structured recipe validation requires detailed heating instructions", () =
   assert.ok(violations.some((value) => value.includes("heat level")));
   assert.ok(violations.some((value) => value.includes("timing nor a doneness cue")));
 });
+
+test("structured recipe validation allows two complete steps but rejects one", () => {
+  const baseRecipe = {
+    dishName: "Simple Cooked Egg",
+    usedIngredients: ["Eggs"],
+    unusedIngredients: [],
+    detectedIngredients: ["Eggs"],
+    pantrySeasoningsUsed: ["Salt"],
+    cuisineMatch: "neutral",
+    cuisineInfluence: null,
+    finalPresentation: "Cooked eggs seasoned with salt.",
+    steps: ["Heat the pan.", "Cook the eggs."],
+    structuredSteps: [
+      {
+        instruction: "Heat the pan over medium heat.",
+        heat: "medium",
+        minimumDurationSeconds: 60,
+        donenessCue: "the pan feels evenly warm",
+      },
+      {
+        instruction: "Cook the eggs with salt over medium-low heat.",
+        heat: "medium-low",
+        minimumDurationSeconds: 180,
+        donenessCue: "the eggs are fully set",
+      },
+    ],
+  };
+
+  assert.deepEqual(
+    structuredRecipeViolations([baseRecipe], ["Eggs"], ["Salt"], [], []),
+    []
+  );
+
+  const violations = structuredRecipeViolations(
+    [{
+      ...baseRecipe,
+      steps: [baseRecipe.steps[1]],
+      structuredSteps: [baseRecipe.structuredSteps[1]],
+    }],
+    ["Eggs"],
+    ["Salt"],
+    [],
+    []
+  );
+  assert.ok(violations.some((value) => value.includes("2 to 8 structured cooking steps")));
+});
