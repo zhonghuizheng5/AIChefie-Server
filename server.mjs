@@ -6,21 +6,28 @@ import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Bonjour } from "bonjour-service";
+import { BillingService } from "./billing.mjs";
 import {
+  applyServerSafetyGuidance,
   buildNoteCompatibilityPrompt,
   buildImagePrompt,
   buildRecipePrompt,
   cleanString,
   combineImageReviews,
+  exactRecipeArray,
   extractImageDataURL,
   generateValidatedImage,
   ingredientConfidenceThreshold,
   normalizeImageReview,
   normalizeConfirmedIngredientDetails,
+  normalizeFavoriteCuisines,
+  normalizeIngredientCategory,
   normalizeIngredientScene,
   normalizeNoteCompatibility,
   normalizeRecipeAudit,
+  normalizeRecipeCount,
   normalizeStringArray,
+  normalizeStructuredSteps,
   openRouterUsageCost,
   sameName,
   structuredRecipeViolations,
@@ -33,6 +40,10 @@ const primaryImageModel =
   process.env.OPENROUTER_PRIMARY_IMAGE_MODEL
   || process.env.OPENROUTER_IMAGE_MODEL
   || "bytedance-seed/seedream-4.5";
+
+const serverVersion = "0.3.0";
+const apiVersion = 4;
+const supportedRecipeCounts = [1, 2, 3];
 
 const config = {
   port: Number(process.env.PORT || 8787),
@@ -50,7 +61,15 @@ const config = {
   fallbackImageModel:
     process.env.OPENROUTER_FALLBACK_IMAGE_MODEL
     || primaryImageModel,
+  premiumImageModel:
+    process.env.OPENROUTER_PREMIUM_IMAGE_MODEL
+    || "openai/gpt-5-image-mini",
+  firebaseProjectID: process.env.FIREBASE_PROJECT_ID || "cooklens-ef35c",
+  bundleID: process.env.APPLE_BUNDLE_ID || "com.zhonghuizheng.CookLens",
+  appAppleID: process.env.APPLE_APP_ID ? Number(process.env.APPLE_APP_ID) : null,
+  appleRootCADirectory: process.env.APPLE_ROOT_CA_DIRECTORY || null,
 };
+const billing = new BillingService(config);
 
 const bonjour = new Bonjour();
 const requestContext = new AsyncLocalStorage();
@@ -104,6 +123,7 @@ async function handleRequest(request, response) {
       sendJSON(response, 200, {
         ok: true,
         configured: Boolean(config.apiKey),
+        supportedRecipeCounts,
         analysisModel: config.analysisModel,
         recipeModel: config.recipeModel,
         reviewModel: config.reviewModel,
@@ -111,14 +131,47 @@ async function handleRequest(request, response) {
         imageModel: config.primaryImageModel,
         primaryImageModel: config.primaryImageModel,
         fallbackImageModel: config.fallbackImageModel,
+        premiumImageModel: config.premiumImageModel,
         simulatorURL: `http://127.0.0.1:${config.port}`,
         phoneURLs: localNetworkURLs(),
       });
       return;
     }
 
+    if (request.method === "GET" && request.url?.startsWith("/api/subscription/status")) {
+      const user = await billing.authenticate(request);
+      const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+      sendJSON(
+        response,
+        200,
+        await billing.status(user.uid, url.searchParams.get("timeZone"))
+      );
+      return;
+    }
+
     if (request.method !== "POST") {
       sendJSON(response, 404, { error: "Not found" });
+      return;
+    }
+
+    const body = await readJSONBody(request);
+
+    if (request.url === "/api/app-store-notifications") {
+      sendJSON(response, 200, await billing.processNotification(body.signedPayload));
+      return;
+    }
+
+    if (request.url === "/api/subscription/sync") {
+      const user = await billing.authenticate(request);
+      sendJSON(
+        response,
+        200,
+        await billing.syncSignedTransaction(
+          user.uid,
+          body.signedTransaction,
+          body.timeZone
+        )
+      );
       return;
     }
 
@@ -128,8 +181,6 @@ async function handleRequest(request, response) {
       });
       return;
     }
-
-    const body = await readJSONBody(request);
 
     if (request.url === "/api/analyze") {
       sendJSON(response, 200, await analyzeIngredients(body));
@@ -142,51 +193,67 @@ async function handleRequest(request, response) {
     }
 
     if (request.url === "/api/dish-image") {
-      const quota = checkImageQuota(request, body);
-      if (quota && quota.used >= quota.dailyLimit) {
-        sendJSON(response, 429, {
-          error: quota.tier === "premium"
-            ? "You have used today's 10 Premium pictures. More become available tomorrow."
-            : "Your free picture for today has been used. Upgrade to Premium or try again tomorrow.",
-          code: "image_quota_exceeded",
-          tier: quota.tier,
-          remainingToday: 0,
-          dailyLimit: quota.dailyLimit,
-        });
-        return;
+      const user = await billing.authenticate(request);
+      const reservation = await billing.reserveImage(user.uid, body.timeZone);
+      try {
+        const result = await generateDishImage(body, reservation.tier);
+        const costUSD =
+          result.source?.reportedCostUSD
+          ?? result.source?.estimatedCostUSD
+          ?? 0;
+        const status = await billing.finishImage(
+          reservation,
+          Boolean(result.imageDataURL),
+          costUSD
+        );
+        Object.assign(result, status);
+        sendJSON(response, 200, result);
+      } catch (error) {
+        await billing.finishImage(reservation, false, 0);
+        throw error;
       }
-
-      const result = await generateDishImage(body);
-      if (quota && result.imageDataURL) {
-        const used = recordImageUse(quota);
-        result.tier = quota.tier;
-        result.dailyLimit = quota.dailyLimit;
-        result.remainingToday = Math.max(0, quota.dailyLimit - used);
-      }
-      sendJSON(response, 200, result);
       return;
     }
 
     if (request.url === "/api/generate") {
+      const user = await billing.authenticate(request);
       const recipeResult = await generateRecipes(body);
       const recipes = await Promise.all(
         recipeResult.recipes.map(async (recipe) => {
+          let reservation;
           try {
+            reservation = await billing.reserveImage(user.uid, body.timeZone);
             const image = await generateDishImage({
               dishName: recipe.dishName,
               detectedIngredients: recipe.detectedIngredients,
+              unusedIngredients: recipe.unusedIngredients,
               confirmedIngredientDetails: recipe.confirmedIngredientDetails,
               pantrySeasoningsUsed: recipe.pantrySeasoningsUsed,
               steps: recipe.steps,
               finalPresentation: recipe.finalPresentation,
-            });
+              cuisineInfluence: recipe.cuisineInfluence,
+              cuisineMatch: recipe.cuisineMatch,
+            }, reservation.tier);
+            const costUSD =
+              image.source?.reportedCostUSD
+              ?? image.source?.estimatedCostUSD
+              ?? 0;
+            const status = await billing.finishImage(
+              reservation,
+              Boolean(image.imageDataURL),
+              costUSD
+            );
             return {
               ...recipe,
               imageDataURL: image.imageDataURL,
               imageError: image.imageError,
               imageVerified: Boolean(image.imageDataURL),
+              ...status,
             };
           } catch (error) {
+            if (reservation) {
+              await billing.finishImage(reservation, false, 0);
+            }
             return {
               ...recipe,
               imageDataURL: null,
@@ -248,7 +315,7 @@ server.listen(config.port, () => {
     protocol: "tcp",
     port: config.port,
     txt: {
-      version: "2",
+      version: String(apiVersion),
       path: "/api/generate",
       urls: phoneURLs.join(","),
     },
@@ -345,6 +412,8 @@ function sendJSON(response, statusCode, payload) {
   });
   response.end(JSON.stringify({
     ...payload,
+    serverVersion,
+    apiVersion,
     ...(requestID ? { requestID } : {}),
   }));
 }
@@ -365,15 +434,47 @@ async function generateRecipes(input) {
   const suppliedIngredientDetails =
     Array.isArray(input.confirmedIngredientDetails)
     && input.confirmedIngredientDetails.length > 0;
-  const confirmedIngredientDetails = normalizeConfirmedIngredientDetails(
+  const allDetails = normalizeConfirmedIngredientDetails(
     input.confirmedIngredientDetails,
-    input.approvedPhotoIngredients
+    input.confirmedPhotoIngredients ?? input.approvedPhotoIngredients
   );
-  const approvedPhotoIngredients = confirmedIngredientDetails.length
-    ? confirmedIngredientDetails.map((ingredient) => ingredient.name)
-    : normalizeStringArray(input.approvedPhotoIngredients);
-  const pantrySeasonings = normalizeStringArray(input.pantrySeasonings);
-  const notes = typeof input.notes === "string" ? input.notes.trim() : "";
+
+  // Main photo ingredients carry raw/cooked details; pantry basics never do.
+  const mainDetails = allDetails.filter((detail) => detail.category !== "pantryBasic");
+  const pantryBasicDetailNames = allDetails
+    .filter((detail) => detail.category === "pantryBasic")
+    .map((detail) => detail.name);
+
+  // Three-part contract: confirmed main ingredients, pantry basics seen in the
+  // photo, and saved pantry seasonings. Older clients are handled by falling back
+  // to the previous single-list fields.
+  const confirmedPhotoIngredients = normalizeStringArray(
+    input.confirmedPhotoIngredients
+    ?? (mainDetails.length ? mainDetails.map((detail) => detail.name) : input.approvedPhotoIngredients)
+  );
+  const visiblePantryBasics = normalizeStringArray(
+    input.visiblePantryBasics ?? pantryBasicDetailNames
+  );
+  const savedPantrySeasonings = normalizeStringArray(
+    input.savedPantrySeasonings ?? input.pantrySeasonings
+  );
+
+  const approvedPhotoIngredients = confirmedPhotoIngredients;
+  // Whitelist pantry = pantry basics visible in the photo plus saved seasonings.
+  const pantrySeasonings = normalizeStringArray([...visiblePantryBasics, ...savedPantrySeasonings]);
+  // Keep ingredient details aligned to the main photo ingredients used for the
+  // closed whitelist and validation.
+  const confirmedIngredientDetails = mainDetails.filter((detail) =>
+    approvedPhotoIngredients.some((name) => sameName(name, detail.name))
+  );
+  const notes = typeof input.notes === "string" ? input.notes.trim().slice(0, 500) : "";
+  const recipeCount = normalizeRecipeCount(input.recipeCount);
+  if (recipeCount === null) {
+    throw httpError(400, "recipeCount must be 1, 2, or 3", "invalid_recipe_count");
+  }
+  // Style hints only: unknown IDs and duplicates are dropped, and the prompt
+  // never lets a cuisine authorize an ingredient outside the whitelist.
+  const favoriteCuisines = normalizeFavoriteCuisines(input.favoriteCuisineIDs);
 
   if (approvedPhotoIngredients.length === 0) {
     throw httpError(400, "approvedPhotoIngredients must contain at least one confirmed photo ingredient");
@@ -391,71 +492,105 @@ async function generateRecipes(input) {
   }
 
   console.log("CookLens generation input", {
-    approvedPhotoIngredients,
+    confirmedPhotoIngredients,
     confirmedIngredientDetails,
+    visiblePantryBasics,
+    savedPantrySeasonings,
     pantrySeasonings,
     notes,
+    recipeCount,
+    favoriteCuisineIDs: favoriteCuisines.map((cuisine) => cuisine.id),
   });
 
+  let noteCompatibility = null;
   if (notes) {
-    const noteCompatibility = await checkNoteCompatibility(
+    noteCompatibility = await checkNoteCompatibility(
       approvedPhotoIngredients,
       pantrySeasonings,
       notes
     );
 
     console.log("CookLens notes compatibility", noteCompatibility);
-    if (!noteCompatibility.compatible) {
+  }
+
+  const baseRequest = {
+    approvedPhotoIngredients,
+    confirmedIngredientDetails,
+    pantrySeasonings,
+    notes,
+    recipeCount,
+    favoriteCuisines,
+    noteCompatibility,
+  };
+
+  let recipes;
+  let repairUsed = false;
+  try {
+    recipes = await requestRecipeOptions(baseRequest);
+  } catch (error) {
+    // A wrong recipe count gets exactly one repair attempt; afterwards we
+    // return a structured error instead of fabricating or cloning options.
+    if (error?.code !== "recipe_count_mismatch") throw error;
+    console.warn("CookLens recipe count mismatch; repair attempt 1", {
+      recipeCount,
+      message: error.message,
+    });
+    try {
+      repairUsed = true;
+      recipes = await requestRecipeOptions({
+        ...baseRequest,
+        repairFeedback: `${error.message}. Return exactly ${recipeCount} recipe${recipeCount === 1 ? "" : "s"} in the recipes array.`,
+      });
+    } catch (repairError) {
+      if (repairError?.code !== "recipe_count_mismatch") throw repairError;
       throw httpError(
-        409,
-        noteCompatibility.reason
-          || "Your notes request food that is not present in the confirmed ingredients.",
-        "note_conflict",
+        502,
+        `AIChefie could not produce exactly ${recipeCount} recipe ${recipeCount === 1 ? "idea" : "ideas"}. Please try again.`,
+        "recipe_count_invalid",
         {
-          conflict: {
-            confirmedIngredients: approvedPhotoIngredients,
-            requestedStyle: noteCompatibility.requestedStyle,
-            unsupportedIngredients: noteCompatibility.unsupportedIngredients,
-            reason: noteCompatibility.reason,
-          },
+          requestedCount: recipeCount,
+          receivedCount: repairError.receivedCount ?? 0,
         }
       );
     }
   }
 
-  let recipes = await requestRecipeOptions({
-    approvedPhotoIngredients,
-    confirmedIngredientDetails,
-    pantrySeasonings,
-    notes,
-  });
   let validation = await validateRecipeSet(
     recipes,
     approvedPhotoIngredients,
     pantrySeasonings,
-    confirmedIngredientDetails
+    confirmedIngredientDetails,
+    favoriteCuisines
   );
 
-  for (let repairAttempt = 1; !validation.valid && repairAttempt <= 2; repairAttempt += 1) {
-    console.warn(`CookLens recipe validation failed; repair attempt ${repairAttempt}`, {
+  if (!validation.valid && !repairUsed) {
+    console.warn("CookLens recipe validation failed; repair attempt 1", {
       reason: validation.reason,
       violations: validation.violations || validation.unapprovedIngredients,
       recipes: recipeLogSummary(recipes),
     });
-    recipes = await requestRecipeOptions({
-      approvedPhotoIngredients,
-      confirmedIngredientDetails,
-      pantrySeasonings,
-      notes,
-      previousRecipes: recipes,
-      repairFeedback: validation.reason,
-    });
-    validation = await validateRecipeSet(
-      recipes,
-      approvedPhotoIngredients,
-      pantrySeasonings,
-      confirmedIngredientDetails
-    );
+    repairUsed = true;
+    try {
+      recipes = await requestRecipeOptions({
+        ...baseRequest,
+        previousRecipes: recipes,
+        repairFeedback: validation.reason,
+      });
+      validation = await validateRecipeSet(
+        recipes,
+        approvedPhotoIngredients,
+        pantrySeasonings,
+        confirmedIngredientDetails,
+        favoriteCuisines
+      );
+    } catch (error) {
+      throw httpError(
+        422,
+        "AIChefie could not create valid recipes. Please try again.",
+        "recipe_validation_failed",
+        { reason: error.message || "Repair response was invalid" }
+      );
+    }
   }
 
   if (!validation.valid) {
@@ -468,15 +603,22 @@ async function generateRecipes(input) {
       .join("; ");
     throw httpError(
       422,
-      `CookLens could not safely repair the recipes. ${detail || validation.reason}`,
+      "AIChefie could not create valid recipes. Please try again.",
       "recipe_validation_failed",
-      { violations }
+      {
+        violations,
+        reason: detail || validation.reason,
+      }
     );
   }
 
   recipes = recipes.map((recipe) => ({
     ...recipe,
-    detectedIngredients: approvedPhotoIngredients,
+    detectedIngredients: recipe.usedIngredients,
+    usedIngredients: recipe.usedIngredients,
+    unusedIngredients: recipe.unusedIngredients,
+    cuisineInfluence: recipe.cuisineInfluence,
+    cuisineMatch: recipe.cuisineMatch,
     confirmedIngredientDetails,
     pantrySeasoningsUsed: recipe.pantrySeasoningsUsed.filter((seasoning) =>
       pantrySeasonings.some((approved) => sameName(approved, seasoning))
@@ -485,6 +627,8 @@ async function generateRecipes(input) {
 
   return {
     recipes,
+    requestedCount: recipeCount,
+    receivedCount: recipes.length,
     source: {
       analysisModel: config.analysisModel,
       recipeModel: config.recipeModel,
@@ -534,13 +678,23 @@ async function analyzeIngredients(input) {
     "- non_food: no edible cooking ingredient is visible.",
     "- unclear: photo is too blurry, cropped, dark, or ambiguous to classify.",
     "",
-    "Identify only edible ingredients that are visibly present when the scene type is prepared_ingredient or cooked_food.",
-    "Do not infer sides, seasonings, sauces, garnish, or ingredients that would normally be served with the visible item.",
+    "Identify every visible item when the scene type is prepared_ingredient or cooked_food, including seasonings and non-food objects, and classify each one.",
+    "Do not infer sides, seasonings, sauces, garnish, or ingredients that would normally be served with the visible item but are not actually shown.",
     "Raw food should be named as precisely as the image supports, without inventing preparation details.",
     "A live animal should set sceneType to live_animal and detectedIngredients to an empty array.",
-    "Return a confidence from 0 to 1 for every ingredient.",
-    "For every ingredient, report state as raw, cooked, or unknown; form such as whole, fillet, sliced, or chopped; and an approximate visible quantity.",
-    `Set requiresConfirmation to true when any important ingredient is below ${ingredientConfidenceThreshold} confidence, any state is unknown, the primary ingredient is ambiguous, or the image may not depict food ingredients.`,
+    "Return a confidence from 0 to 1 for every item.",
+    "",
+    "Classify each item with a category:",
+    "- mainIngredient: a cookable food such as pork, eggs, rice, broccoli, or onion.",
+    "- pantryBasic: a seasoning or pantry staple such as salt, oil, pepper, vinegar, sauces, herbs, or spices.",
+    "- nonFood: a container, knife, pan, appliance, cutting board, or other object that is not food.",
+    "- uncertain: an item you cannot confidently classify.",
+    "",
+    "Provide a canonicalName that maps a non-culinary or imprecise label to its standard culinary ingredient name when confidence is high, for example Pig becomes Pork. Use null when no normalization is needed. Never convert a visible live animal into meat.",
+    "For mainIngredient and uncertain items report state as raw, cooked, or unknown.",
+    "For pantryBasic and nonFood items set state to notApplicable.",
+    "Report form such as whole, fillet, sliced, or chopped, and an approximate visible quantity, only for mainIngredient and uncertain items. Use null for pantryBasic and nonFood, and never pair a seasoning with a meaningless quantity such as salt with 1 container.",
+    `Set requiresConfirmation to true when any important ingredient is below ${ingredientConfidenceThreshold} confidence, any cookable state is unknown, the primary ingredient is ambiguous, any item is uncertain, or the image may not depict food ingredients.`,
     "Return compact JSON only.",
     "",
 `{
@@ -550,8 +704,10 @@ async function analyzeIngredients(input) {
   "detectedIngredients": [
     {
       "name": "string",
+      "category": "mainIngredient | pantryBasic | nonFood | uncertain",
+      "canonicalName": "standard culinary name or null",
       "confidence": 0.0,
-      "state": "raw | cooked | unknown",
+      "state": "raw | cooked | notApplicable | unknown",
       "form": "short description or null",
       "quantity": "short estimate or null"
     }
@@ -601,7 +757,7 @@ async function analyzeIngredients(input) {
   if (scene.sceneType === "non_food") {
     throw httpError(
       422,
-      "CookLens could not identify a visible cooking ingredient in this photo.",
+      "AIChefie could not identify a visible cooking ingredient in this photo.",
       "no_food_detected",
       { scene }
     );
@@ -609,25 +765,33 @@ async function analyzeIngredients(input) {
   if (scene.sceneType === "unclear" && detectedIngredients.length === 0) {
     throw httpError(
       422,
-      "CookLens could not clearly identify the ingredient. Try a sharper, closer photo.",
+      "AIChefie could not clearly identify the ingredient. Try a sharper, closer photo.",
       "photo_unclear",
       { scene }
     );
   }
-  if (detectedIngredients.length === 0) {
+  // Non-food objects (containers, utensils, appliances) are excluded from the
+  // cooking flow. A photo of only non-food items has no usable ingredient.
+  const cookableIngredients = detectedIngredients.filter(
+    (ingredient) => ingredient.category !== "nonFood"
+  );
+  if (cookableIngredients.length === 0) {
     throw httpError(
       422,
-      "CookLens could not identify a visible cooking ingredient in this photo.",
+      "AIChefie could not identify a visible cooking ingredient in this photo.",
       "no_food_detected",
       { scene }
     );
   }
 
-  const lowConfidence = detectedIngredients.some(
+  const lowConfidence = cookableIngredients.some(
     (ingredient) => ingredient.confidence < ingredientConfidenceThreshold
   );
-  const unknownState = detectedIngredients.some(
+  const unknownState = cookableIngredients.some(
     (ingredient) => ingredient.state === "unknown"
+  );
+  const uncertainCategory = cookableIngredients.some(
+    (ingredient) => ingredient.category === "uncertain"
   );
   const weakSceneClassification = scene.sceneConfidence < ingredientConfidenceThreshold;
 
@@ -638,6 +802,7 @@ async function analyzeIngredients(input) {
       Boolean(parsed.requiresConfirmation)
       || lowConfidence
       || unknownState
+      || uncertainCategory
       || scene.sceneType === "unclear"
       || weakSceneClassification,
   });
@@ -649,11 +814,12 @@ async function analyzeIngredients(input) {
       Boolean(parsed.requiresConfirmation)
       || lowConfidence
       || unknownState
+      || uncertainCategory
       || scene.sceneType === "unclear"
       || weakSceneClassification,
     uncertaintyReason:
       cleanString(parsed.uncertaintyReason)
-      || (lowConfidence || unknownState || scene.sceneType === "unclear" || weakSceneClassification
+      || (lowConfidence || unknownState || uncertainCategory || scene.sceneType === "unclear" || weakSceneClassification
         ? "Confirm the ingredient and whether it is raw or already cooked."
         : null),
   };
@@ -664,6 +830,9 @@ async function requestRecipeOptions({
   confirmedIngredientDetails,
   pantrySeasonings,
   notes,
+  recipeCount = 2,
+  favoriteCuisines = [],
+  noteCompatibility = null,
   previousRecipes,
   repairFeedback,
 }) {
@@ -674,7 +843,7 @@ async function requestRecipeOptions({
       {
         role: "system",
         content:
-          "You are CookLens, a strict practical cooking assistant. The supplied ingredient whitelist is absolute. Return valid compact JSON only.",
+          "You are AIChefie, a strict practical cooking assistant. The supplied ingredient whitelist is absolute. Return valid compact JSON only.",
       },
       {
         role: "user",
@@ -683,6 +852,9 @@ async function requestRecipeOptions({
           confirmedIngredientDetails,
           pantrySeasonings,
           notes,
+          recipeCount,
+          favoriteCuisines,
+          noteCompatibility,
           previousRecipes,
           repairFeedback,
         }),
@@ -690,13 +862,15 @@ async function requestRecipeOptions({
     ],
     response_format: { type: "json_object" },
     temperature: previousRecipes ? 0 : 0.25,
-    max_tokens: 1800,
+    max_tokens: 1400 + (recipeCount * 700),
   });
 
   return normalizeRecipeResponse(
     parsed,
     pantrySeasonings,
-    notes
+    notes,
+    recipeCount,
+    confirmedIngredientDetails
   );
 }
 
@@ -704,13 +878,15 @@ async function validateRecipeSet(
   recipes,
   approvedPhotoIngredients,
   pantrySeasonings,
-  confirmedIngredientDetails
+  confirmedIngredientDetails,
+  favoriteCuisines
 ) {
   const structuredViolations = structuredRecipeViolations(
     recipes,
     approvedPhotoIngredients,
     pantrySeasonings,
-    confirmedIngredientDetails
+    confirmedIngredientDetails,
+    favoriteCuisines
   );
   if (structuredViolations.length) {
     return {
@@ -726,15 +902,22 @@ async function validateRecipeSet(
     `Allowed photo ingredients: ${approvedPhotoIngredients.join(", ")}`,
     `Confirmed ingredient details: ${JSON.stringify(confirmedIngredientDetails)}`,
     `Allowed pantry seasonings: ${pantrySeasonings.length ? pantrySeasonings.join(", ") : "none"}`,
+    `Selected favorite cuisines: ${favoriteCuisines.length ? favoriteCuisines.map((cuisine) => cuisine.displayName).join(", ") : "none"}`,
     "",
     "Inspect dish names, ingredient arrays, and every instruction.",
     "Inspect finalPresentation as part of the recipe.",
+    "Every confirmed photo ingredient must appear exactly once in usedIngredients or unusedIngredients.",
+    "Ingredients in unusedIngredients must not appear in the dish name, instructions, or finalPresentation.",
     "Water and heat are allowed utilities.",
     "Soup liquid, glaze, broth, or sauce made only from water and approved pantry seasonings is allowed and is not an extra ingredient.",
     "Do not infer hidden ingredients from color, shine, texture, or the name of an approved seasoning.",
     "Raw ingredients must be cooked appropriately. Cooked ingredients must not be treated as raw or given raw-to-done instructions.",
     "The recipe must preserve confirmed forms and quantities instead of silently changing to another cut, whole animal, or extra pieces.",
     "The separate pairingSuggestion may mention another food, but that food must not appear anywhere else.",
+    "cuisineInfluence must be one of the selected favorite cuisines, or null for a neutral recipe.",
+    "cuisineMatch must be traditional, inspired, or neutral.",
+    "Use traditional only when the available ingredients and technique honestly support that claim. Otherwise require inspired or neutral.",
+    "Do not accept an unrequested cuisine or a misleading traditional dish name.",
     "Cooking-style and dish-format words are not ingredients. Do not reject salad, soup, bowl, roasted, grilled, stir-fry, braised, glazed, spicy, crispy, or similar words unless the recipe actually introduces a concrete unapproved food.",
     "For an extra-food violation, name the concrete unapproved ingredient and quote the exact recipe text.",
     "For a raw/cooked or form mismatch, use ingredient = 'food state' or 'ingredient form' and quote the exact conflicting recipe text.",
@@ -776,78 +959,25 @@ function recipeLogSummary(recipes) {
   return recipes.map((recipe, index) => ({
     optionIndex: index + 1,
     dishName: recipe.dishName,
-    detectedIngredients: recipe.detectedIngredients,
+    usedIngredients: recipe.usedIngredients,
+    unusedIngredients: recipe.unusedIngredients,
+    cuisineInfluence: recipe.cuisineInfluence,
+    cuisineMatch: recipe.cuisineMatch,
     pantrySeasoningsUsed: recipe.pantrySeasoningsUsed,
     steps: recipe.steps,
   }));
 }
 
-// Backup daily image quota. The app enforces the limit with a local counter;
-// this in-memory map catches clients that bypass or lose that counter. Counts
-// reset when the user's local calendar day changes (and on server restart,
-// which is acceptable for a backup).
-const FREE_DAILY_IMAGE_LIMIT = 1;
-const PREMIUM_DAILY_IMAGE_LIMIT = 10;
-const imageQuotaUsage = new Map();
-
-function checkImageQuota(request, body) {
-  const userKey = imageQuotaUserKey(request, body);
-  if (!userKey) {
-    return null;
-  }
-
-  const tier = cleanString(body?.tier) === "premium" ? "premium" : "free";
-  const dailyLimit = tier === "premium" ? PREMIUM_DAILY_IMAGE_LIMIT : FREE_DAILY_IMAGE_LIMIT;
-  const day = localDayKey(cleanString(body?.timeZone));
-  const entry = imageQuotaUsage.get(userKey);
-  const used = entry && entry.day === day ? entry.used : 0;
-  return { userKey, tier, dailyLimit, day, used };
-}
-
-function recordImageUse(quota) {
-  const used = quota.used + 1;
-  imageQuotaUsage.set(quota.userKey, { day: quota.day, used });
-  return used;
-}
-
-function imageQuotaUserKey(request, body) {
-  const authorization = cleanString(request.headers.authorization);
-  if (authorization && authorization.startsWith("Bearer ")) {
-    const uid = firebaseUserID(authorization.slice("Bearer ".length));
-    if (uid) {
-      return uid;
-    }
-  }
-  return cleanString(body?.quotaUserID) || null;
-}
-
-function firebaseUserID(token) {
-  try {
-    const payload = token.split(".")[1];
-    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    return cleanString(decoded.user_id) || cleanString(decoded.sub) || null;
-  } catch {
-    return null;
-  }
-}
-
-function localDayKey(timeZone) {
-  const options = { year: "numeric", month: "2-digit", day: "2-digit" };
-  try {
-    return new Intl.DateTimeFormat("en-CA", { ...options, timeZone: timeZone || "UTC" })
-      .format(new Date());
-  } catch {
-    return new Intl.DateTimeFormat("en-CA", { ...options, timeZone: "UTC" })
-      .format(new Date());
-  }
-}
-
-async function generateDishImage(input) {
+async function generateDishImage(input, tier = "free") {
   const dishName = requiredString(input.dishName, "dishName");
   const detectedIngredients = normalizeStringArray(input.detectedIngredients);
-  const confirmedIngredientDetails = normalizeConfirmedIngredientDetails(
+  const unusedIngredients = normalizeStringArray(input.unusedIngredients);
+  const allConfirmedIngredientDetails = normalizeConfirmedIngredientDetails(
     input.confirmedIngredientDetails,
     detectedIngredients
+  );
+  const confirmedIngredientDetails = allConfirmedIngredientDetails.filter((detail) =>
+    detectedIngredients.some((ingredient) => sameName(ingredient, detail.name))
   );
   const pantrySeasoningsUsed = normalizeStringArray(input.pantrySeasoningsUsed);
   const steps = normalizeStringArray(input.steps);
@@ -856,16 +986,24 @@ async function generateDishImage(input) {
     throw httpError(400, "detectedIngredients must contain the confirmed photo ingredients");
   }
 
-  const recipe = { dishName, steps };
+  const recipe = {
+    dishName,
+    steps,
+    cuisineInfluence: cleanString(input.cuisineInfluence) || null,
+    cuisineMatch: cleanString(input.cuisineMatch).toLowerCase() || "neutral",
+  };
   const result = await generateValidatedImage({
     maxAttempts: 2,
     generateImage: async (retryViolations, attempt) => {
-      const model = attempt === 1
-        ? config.primaryImageModel
-        : config.fallbackImageModel;
+      const model = tier === "premium"
+        ? config.premiumImageModel
+        : attempt === 1
+          ? config.primaryImageModel
+          : config.fallbackImageModel;
       const prompt = buildImagePrompt({
         recipe,
         approvedPhotoIngredients: detectedIngredients,
+        forbiddenPhotoIngredients: unusedIngredients,
         pantrySeasoningsUsed,
         confirmedIngredientDetails,
         finalPresentation,
@@ -929,6 +1067,7 @@ async function generateDishImage(input) {
       imageModel: result.records.at(-1)?.model || config.primaryImageModel,
       primaryImageModel: config.primaryImageModel,
       fallbackImageModel: config.fallbackImageModel,
+      premiumImageModel: config.premiumImageModel,
       reviewModel: config.reviewModel,
       secondOpinionModel: config.secondOpinionModel,
       modelsUsed: result.records.map((record) => record.model).filter(Boolean),
@@ -946,7 +1085,7 @@ async function validateGeneratedImage(
   finalPresentation
 ) {
   const prompt = [
-    "Inspect the generated food image for CookLens ingredient compliance.",
+    "Inspect the generated food image for AIChefie ingredient compliance.",
     `Allowed photo ingredients: ${approvedPhotoIngredients.join(", ")}`,
     `Confirmed ingredient details: ${JSON.stringify(confirmedIngredientDetails)}`,
     `Allowed pantry seasonings incorporated into the food: ${pantrySeasoningsUsed.length ? pantrySeasoningsUsed.join(", ") : "none"}`,
@@ -1135,7 +1274,7 @@ async function callOpenRouterStructured({
 
   throw httpError(
     502,
-    `CookLens received an incomplete ${stage} response. Please try again.`,
+    `AIChefie received an incomplete ${stage} response. Please try again.`,
     "structured_response_invalid",
     { stage, reason: lastError?.message || "Invalid JSON" }
   );
@@ -1206,24 +1345,49 @@ function openRouterContentText(content) {
   return String(content || "");
 }
 
-function normalizeRecipeResponse(parsed, pantrySeasonings, notes) {
-  const sourceRecipes = Array.isArray(parsed.recipes) ? parsed.recipes.slice(0, 2) : [];
-  if (sourceRecipes.length !== 2) {
-    throw new Error("Recipe response must contain exactly two recipes");
-  }
+function normalizeRecipeResponse(
+  parsed,
+  pantrySeasonings,
+  notes,
+  recipeCount = 2,
+  confirmedIngredientDetails = []
+) {
+  const sourceRecipes = exactRecipeArray(parsed.recipes, recipeCount);
 
   return sourceRecipes.map((recipe, index) => {
     const dishName = cleanString(recipe.dishName) || `Recipe Option ${index + 1}`;
-    const detectedIngredients = normalizeStringArray(recipe.detectedIngredients).slice(0, 8);
+    const usedIngredients = normalizeStringArray(
+      recipe.usedIngredients ?? recipe.detectedIngredients
+    ).slice(0, 10);
+    const unusedIngredients = normalizeStringArray(recipe.unusedIngredients).slice(0, 10);
     const pantrySeasoningsUsed = normalizeStringArray(recipe.pantrySeasoningsUsed).slice(0, 8);
-    const steps = normalizeStringArray(recipe.steps).slice(0, 8);
+    const plainSteps = normalizeStringArray(recipe.steps).slice(0, 8);
+    const structuredSteps = applyServerSafetyGuidance(
+      normalizeStructuredSteps(recipe.structuredSteps, plainSteps),
+      confirmedIngredientDetails
+    );
+    // When structured steps exist they are authoritative, so the plain `steps`
+    // alias is rebuilt from their instructions to stay in sync and ordered.
+    const steps = structuredSteps.length
+      ? structuredSteps.map((step) => step.instruction)
+      : plainSteps;
+    const requestedCuisineMatch = cleanString(recipe.cuisineMatch).toLowerCase();
+    const cuisineMatch = ["traditional", "inspired", "neutral"].includes(requestedCuisineMatch)
+      ? requestedCuisineMatch
+      : "";
+    const cuisineInfluence = cleanString(recipe.cuisineInfluence) || null;
 
     return {
       dishName,
-      detectedIngredients,
+      usedIngredients,
+      unusedIngredients,
+      detectedIngredients: usedIngredients,
       pantrySeasoningsUsed,
+      cuisineInfluence,
+      cuisineMatch,
       cookingTime: cleanString(recipe.cookingTime) || "15 min",
       steps: steps.length ? steps : ["Cook the ingredients together until done, then season to taste."],
+      structuredSteps,
       finalPresentation: cleanString(recipe.finalPresentation)
         || `${dishName} showing only the approved food.`,
       pairingSuggestion: cleanString(recipe.pairingSuggestion) || null,
@@ -1249,10 +1413,43 @@ function normalizeDetectedIngredients(value) {
       : 0;
 
     seen.add(normalizedName);
+    const category = normalizeIngredientCategory(ingredient?.category);
+    const canonicalName = cleanString(ingredient?.canonicalName) || null;
     const rawState = cleanString(ingredient?.state).toLowerCase();
+
+    if (category === "pantryBasic") {
+      // Seasonings are never raw or cooked, and a quantity/form pair such as
+      // "salt — 1 container" is meaningless, so only the name is kept.
+      result.push({
+        name,
+        category,
+        canonicalName,
+        confidence,
+        state: "notApplicable",
+        form: null,
+        quantity: null,
+      });
+      continue;
+    }
+
+    if (category === "nonFood") {
+      result.push({
+        name,
+        category,
+        canonicalName,
+        confidence,
+        state: "notApplicable",
+        form: null,
+        quantity: null,
+      });
+      continue;
+    }
+
     const state = ["raw", "cooked"].includes(rawState) ? rawState : "unknown";
     result.push({
       name,
+      category,
+      canonicalName,
       confidence,
       state,
       form: cleanString(ingredient?.form) || null,
@@ -1260,7 +1457,7 @@ function normalizeDetectedIngredients(value) {
     });
   }
 
-  return result.slice(0, 10);
+  return result.slice(0, 12);
 }
 
 function estimatedImageCostUSD(model) {
