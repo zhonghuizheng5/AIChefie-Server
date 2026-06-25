@@ -467,6 +467,54 @@ export function buildCuisineAssignmentPlan(recipeCount, favoriteCuisines) {
   });
 }
 
+export function cuisineDisplayLabel(cuisineInfluence, cuisineMatch) {
+  const cuisine = cleanString(cuisineInfluence);
+  switch (cleanString(cuisineMatch).toLowerCase()) {
+    case "traditional":
+      return cuisine ? `Traditional ${cuisine}` : null;
+    case "inspired":
+      return cuisine ? `${cuisine}-inspired` : null;
+    default:
+      return null;
+  }
+}
+
+function normalizePrefixText(value) {
+  return normalizeName(value)
+    .replace(/\s*[-\u2010-\u2015]\s*/g, "-");
+}
+
+function redundantCuisineLabels(cuisineInfluence, cuisineMatch) {
+  const label = cuisineDisplayLabel(cuisineInfluence, cuisineMatch);
+  if (!label) return [];
+
+  const spacedLabel = label.replace(/-/g, " ");
+  return spacedLabel === label ? [label] : [label, spacedLabel];
+}
+
+export function redundantCuisineDishNamePrefix(
+  dishName,
+  cuisineInfluence,
+  cuisineMatch
+) {
+  const normalizedTitle = normalizePrefixText(dishName);
+  if (!normalizedTitle) return null;
+
+  for (const label of redundantCuisineLabels(cuisineInfluence, cuisineMatch)) {
+    const normalizedLabel = normalizePrefixText(label);
+    if (
+      normalizedTitle === normalizedLabel
+      || normalizedTitle.startsWith(`${normalizedLabel} `)
+      || normalizedTitle.startsWith(`${normalizedLabel}:`)
+      || normalizedTitle.startsWith(`${normalizedLabel}-`)
+    ) {
+      return label;
+    }
+  }
+
+  return null;
+}
+
 function containsNormalizedPhrase(text, phrase) {
   const normalizedText = normalizeName(text);
   const normalizedPhrase = normalizeName(phrase);
@@ -670,6 +718,17 @@ export function structuredRecipeViolations(
         `Option ${index + 1} must use neutral cuisine metadata when no favorite cuisine was selected`
       );
     }
+
+    const redundantCuisinePrefix = redundantCuisineDishNamePrefix(
+      recipe.dishName,
+      cuisineInfluence,
+      cuisineMatch
+    );
+    if (redundantCuisinePrefix) {
+      violations.push(
+        `Option ${index + 1} dishName must not repeat the displayed cuisine label "${redundantCuisinePrefix}"; keep dishName as the clean dish title only`
+      );
+    }
   }
 
   return violations;
@@ -727,6 +786,7 @@ export function buildRecipePrompt({
     "- Do not mention unusedIngredients in the dish name, cooking steps, or finalPresentation.",
     "- detectedIngredients is a compatibility alias and must exactly match usedIngredients.",
     "- pantrySeasoningsUsed must contain only exact names from Pantry seasonings.",
+    "- dishName must be a clean dish title only. Do not start it with the cuisine label shown by cuisineInfluence and cuisineMatch, such as 'Chinese-inspired', 'Korean-inspired', or 'Traditional Chinese'.",
     "- pairingSuggestion is separate and may name one complementary food not in the whitelist. It must not appear anywhere else in the recipe.",
     "- Keep the recipes practical for home cooking.",
     "- Return compact JSON only.",
@@ -741,7 +801,7 @@ export function buildRecipePrompt({
           "Do not create fusion food unless the user explicitly asks for fusion in Notes.",
           "Cuisine preference changes style only. It never authorizes an ingredient outside the whitelist.",
           "Use cuisineMatch='traditional' only when the defining ingredients and technique are supported by the whitelist.",
-          "If a traditional dish is not honestly possible, use cuisineMatch='inspired' and a truthful '<Cuisine>-inspired' name.",
+          "If a traditional dish is not honestly possible, use cuisineMatch='inspired' and set cuisineInfluence to the selected cuisine, but keep dishName free of the '<Cuisine>-inspired' prefix because the app displays that label separately.",
           "If even an inspired result would be misleading, use cuisineMatch='neutral', set cuisineInfluence to null, and create a practical neutral recipe.",
         ]
           .filter(Boolean)

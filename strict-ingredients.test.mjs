@@ -22,6 +22,7 @@ import {
   normalizeRecipeCount,
   normalizeStructuredSteps,
   openRouterUsageCost,
+  redundantCuisineDishNamePrefix,
   structuredRecipeViolations,
 } from "./strict-ingredients.mjs";
 
@@ -201,6 +202,8 @@ test("recipe prompt treats favorite cuisines as style only", () => {
   assert.match(withCuisines, /Cuisine assignment plan:/);
   assert.match(withCuisines, /Do not create fusion food unless the user explicitly asks/);
   assert.match(withCuisines, /cuisineMatch='traditional'/);
+  assert.match(withCuisines, /dishName must be a clean dish title only/);
+  assert.match(withCuisines, /keep dishName free of the '<Cuisine>-inspired' prefix/);
 
   const singleRecipe = buildRecipePrompt({
     ...base,
@@ -567,6 +570,105 @@ test("structured validation enforces cuisine assignment and honest neutral metad
     noPreference.some((violation) => violation.includes("no favorite cuisine")),
     true
   );
+});
+
+test("structured validation rejects redundant cuisine labels in dish names", () => {
+  const baseRecipe = {
+    dishName: "Pork Fried Rice",
+    usedIngredients: ["Pork", "Rice"],
+    unusedIngredients: [],
+    detectedIngredients: ["Pork", "Rice"],
+    pantrySeasoningsUsed: ["Salt"],
+    steps: ["Cook the pork and rice with salt."],
+    finalPresentation: "Pork and rice cooked together.",
+    cuisineInfluence: "Caribbean",
+    cuisineMatch: "inspired",
+  };
+  const cuisines = normalizeFavoriteCuisines(["caribbean"]);
+
+  assert.deepEqual(
+    structuredRecipeViolations(
+      [baseRecipe],
+      ["Pork", "Rice"],
+      ["Salt"],
+      [],
+      cuisines
+    ),
+    []
+  );
+
+  const redundant = structuredRecipeViolations(
+    [{ ...baseRecipe, dishName: "Caribbean-inspired Pork Fried Rice" }],
+    ["Pork", "Rice"],
+    ["Salt"],
+    [],
+    cuisines
+  );
+  assert.equal(
+    redundant.some((violation) => violation.includes("dishName must not repeat")),
+    true
+  );
+  assert.equal(
+    redundantCuisineDishNamePrefix(
+      "Caribbean Inspired Pork Fried Rice",
+      "Caribbean",
+      "inspired"
+    ),
+    "Caribbean inspired"
+  );
+});
+
+test("structured validation preserves naturally cuisine-specific dish names", () => {
+  const cases = [
+    {
+      dishName: "Pad Thai",
+      usedIngredients: ["Noodles"],
+      steps: ["Cook the noodles."],
+      finalPresentation: "Cooked noodles.",
+      cuisineInfluence: "Thai",
+      cuisineMatch: "inspired",
+      favoriteCuisineIDs: ["thai"],
+    },
+    {
+      dishName: "Congee",
+      usedIngredients: ["Rice"],
+      steps: ["Simmer the rice with water."],
+      finalPresentation: "Soft cooked rice.",
+      cuisineInfluence: "Chinese",
+      cuisineMatch: "inspired",
+      favoriteCuisineIDs: ["chinese"],
+    },
+    {
+      dishName: "Mapo Tofu",
+      usedIngredients: ["Tofu"],
+      steps: ["Warm the tofu."],
+      finalPresentation: "Warm tofu.",
+      cuisineInfluence: "Chinese",
+      cuisineMatch: "inspired",
+      favoriteCuisineIDs: ["chinese"],
+    },
+  ];
+
+  for (const testCase of cases) {
+    const recipe = {
+      ...testCase,
+      unusedIngredients: [],
+      detectedIngredients: testCase.usedIngredients,
+      pantrySeasoningsUsed: ["Salt"],
+    };
+    delete recipe.favoriteCuisineIDs;
+
+    assert.deepEqual(
+      structuredRecipeViolations(
+        [recipe],
+        testCase.usedIngredients,
+        ["Salt"],
+        [],
+        normalizeFavoriteCuisines(testCase.favoriteCuisineIDs)
+      ),
+      []
+    );
+  }
 });
 
 test("structured validation rejects unused ingredients in recipe text without substring false positives", () => {

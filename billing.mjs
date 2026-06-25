@@ -1,113 +1,159 @@
-import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-import {
-  Environment,
-  SignedDataVerifier,
-} from "@apple/app-store-server-library";
+import { randomUUID } from "node:crypto";
 import {
   applicationDefault,
   cert,
   getApps,
   initializeApp,
 } from "firebase-admin/app";
+import { getAppCheck } from "firebase-admin/app-check";
 import { getAuth } from "firebase-admin/auth";
 import {
   FieldValue,
-  Timestamp,
   getFirestore,
 } from "firebase-admin/firestore";
+import { getStorage } from "firebase-admin/storage";
 
-const PREMIUM_PRODUCT_ID = "com.zhonghuizheng.CookLens.premium.monthly";
+export const DAILY_IMAGE_LIMIT = 3;
+
 const TIME_ZONE_CHANGE_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 const RESERVATION_TIMEOUT_MS = 10 * 60 * 1000;
+const RECENT_SIGN_IN_SECONDS = 10 * 60;
 
 export class BillingService {
-  constructor(config) {
-    this.config = config;
+  constructor(config, dependencies = {}) {
+    this.production = Boolean(config.production);
     this.memory = new MemoryBillingStore();
-    this.firebase = initializeFirebase(config);
-    this.appleVerifiers = createAppleVerifiers(config);
+    this.firebase = dependencies.firebase || initializeFirebase(config);
+
+    if (this.production && !this.firebase.hasAdminCredentials) {
+      throw new Error(
+        "Firebase Admin credentials are required in production. "
+        + "Set FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
+      );
+    }
   }
 
   async authenticate(request) {
     const authorization = request.headers.authorization || "";
-    const token = authorization.startsWith("Bearer ")
+    const idToken = authorization.startsWith("Bearer ")
       ? authorization.slice("Bearer ".length).trim()
       : "";
-    if (!token) {
-      throw billingError(401, "Sign in is required.", "authentication_required");
+    const appCheckToken = String(
+      request.headers["x-firebase-appcheck"] || ""
+    ).trim();
+
+    if (!idToken) {
+      throw serviceError(401, "Sign in is required.", "authentication_required");
+    }
+    if (!appCheckToken) {
+      throw serviceError(401, "App verification is required.", "app_check_required");
     }
 
     try {
-      const decoded = await this.firebase.auth.verifyIdToken(token);
-      return { uid: decoded.uid };
+      const [decoded, appCheck] = await Promise.all([
+        this.firebase.auth.verifyIdToken(idToken),
+        this.firebase.appCheck.verifyToken(appCheckToken),
+      ]);
+      return {
+        uid: decoded.uid,
+        isAnonymous:
+          decoded.firebase?.sign_in_provider === "anonymous",
+        authTime: Number(decoded.auth_time || 0),
+        appID: appCheck.appId,
+      };
     } catch {
-      throw billingError(
+      throw serviceError(
         401,
-        "Your CookLens sign-in session could not be verified.",
+        "Your AIChefie session or app verification could not be verified.",
         "authentication_required"
       );
     }
   }
 
+  async verifyAnonymousIDToken(idToken, targetUID) {
+    try {
+      const decoded = await this.firebase.auth.verifyIdToken(idToken);
+      if (
+        decoded.uid === targetUID
+        || decoded.firebase?.sign_in_provider !== "anonymous"
+      ) {
+        throw new Error("Token is not an obsolete anonymous account.");
+      }
+      return decoded.uid;
+    } catch {
+      throw serviceError(
+        400,
+        "The anonymous account could not be verified.",
+        "invalid_anonymous_account"
+      );
+    }
+  }
+
+  requireRecentSignIn(user, nowSeconds = Math.floor(Date.now() / 1000)) {
+    if (user.isAnonymous) return;
+    if (!user.authTime || nowSeconds - user.authTime > RECENT_SIGN_IN_SECONDS) {
+      throw serviceError(
+        401,
+        "Sign in again before permanently deleting this account.",
+        "recent_authentication_required"
+      );
+    }
+  }
+
+  async deleteObsoleteAnonymousAccount(uid) {
+    await this.deleteUserData(uid, { deleteAuthUser: true });
+  }
+
+  async deleteAccount(user) {
+    this.requireRecentSignIn(user);
+    await this.deleteUserData(user.uid, { deleteAuthUser: true });
+  }
+
+  async deleteUserData(uid, { deleteAuthUser }) {
+    if (!this.firebase.hasAdminCredentials && !this.production) {
+      this.memory.deleteUser(uid);
+      return;
+    }
+
+    const firestore = this.firebase.firestore;
+    await deleteDocumentTree(firestore, `users/${uid}`);
+    await deleteStoragePrefix(this.firebase.storage, `users/${uid}/`);
+    await Promise.all([
+      deleteDocumentTree(firestore, `imageUsage/${uid}`),
+      deleteDocumentTree(firestore, `billing/${uid}`),
+      deleteLegacyTransactions(firestore, uid),
+    ]);
+
+    if (deleteAuthUser) {
+      try {
+        await this.firebase.auth.deleteUser(uid);
+      } catch (error) {
+        if (error?.code !== "auth/user-not-found") throw error;
+      }
+    }
+  }
+
   async status(uid, requestedTimeZone) {
     const timeZone = await this.resolveTimeZone(uid, requestedTimeZone);
-    const entitlement = await this.entitlement(uid);
-    return this.usageStore().status(uid, entitlement.tier, timeZone);
+    return this.usageStore().status(uid, timeZone);
   }
 
   async reserveImage(uid, requestedTimeZone) {
     const timeZone = await this.resolveTimeZone(uid, requestedTimeZone);
-    const entitlement = await this.entitlement(uid);
-    return this.usageStore().reserve(uid, entitlement.tier, timeZone);
+    return this.usageStore().reserve(uid, timeZone);
   }
 
   async finishImage(reservation, success, costUSD = 0) {
     await this.usageStore().finish(reservation, success, costUSD);
-    return this.usageStore().status(
-      reservation.uid,
-      reservation.tier,
-      reservation.timeZone
-    );
-  }
-
-  async syncSignedTransaction(uid, signedTransaction) {
-    const transaction = await this.verifyTransaction(signedTransaction);
-    if (transaction.productId !== PREMIUM_PRODUCT_ID) {
-      throw billingError(400, "This purchase is not a CookLens Premium subscription.");
-    }
-    if (!transaction.originalTransactionId) {
-      throw billingError(400, "The App Store transaction is missing its original identifier.");
-    }
-
-    await this.bindTransaction(uid, transaction);
-    return this.status(uid, "UTC");
-  }
-
-  async processNotification(signedPayload) {
-    const { verifier, notification } = await this.verifyNotification(signedPayload);
-    const signedTransaction = notification.data?.signedTransactionInfo;
-    if (!signedTransaction) {
-      return { ok: true, ignored: true };
-    }
-
-    const transaction = await verifier.verifyAndDecodeTransaction(signedTransaction);
-    const originalTransactionId = transaction.originalTransactionId;
-    if (!originalTransactionId) {
-      return { ok: true, ignored: true };
-    }
-
-    const binding = await this.transactionBinding(originalTransactionId);
-    if (!binding?.uid) {
-      return { ok: true, ignored: true };
-    }
-
-    await this.bindTransaction(binding.uid, transaction, { allowExistingBinding: true });
-    return { ok: true };
+    return this.usageStore().status(reservation.uid, reservation.timeZone);
   }
 
   usageStore() {
-    return this.firebase.hasAdminCredentials ? this.firebaseStore() : this.memory;
+    if (this.firebase.hasAdminCredentials) return this.firebaseStore();
+    if (this.production) {
+      throw new Error("In-memory quota storage is disabled in production.");
+    }
+    return this.memory;
   }
 
   firebaseStore() {
@@ -115,24 +161,6 @@ export class BillingService {
       this._firebaseStore = new FirestoreBillingStore(this.firebase.firestore);
     }
     return this._firebaseStore;
-  }
-
-  async entitlement(uid) {
-    if (!this.firebase.hasAdminCredentials) {
-      return this.memory.entitlement(uid);
-    }
-
-    const snapshot = await this.firebase.firestore.doc(`billing/${uid}`).get();
-    const data = snapshot.data() || {};
-    const expiresAt = timestampMillis(data.expiresAt);
-    const active =
-      data.status === "active"
-      && expiresAt !== null
-      && expiresAt > Date.now();
-    return {
-      tier: active ? "premium" : "free",
-      expiresAt,
-    };
   }
 
   async resolveTimeZone(uid, requestedTimeZone) {
@@ -149,130 +177,21 @@ export class BillingService {
       const changedAt = timestampMillis(data.timeZoneUpdatedAt) || 0;
 
       if (!current) {
-        transaction.set(
-          profileRef,
-          {
-            timeZone: candidate,
-            timeZoneUpdatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-        return candidate;
-      }
-
-      if (current === candidate) {
-        return current;
-      }
-
-      if (Date.now() - changedAt < TIME_ZONE_CHANGE_COOLDOWN_MS) {
-        return current;
-      }
-
-      transaction.set(
-        profileRef,
-        {
+        transaction.set(profileRef, {
           timeZone: candidate,
           timeZoneUpdatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+        }, { merge: true });
+        return candidate;
+      }
+      if (current === candidate) return current;
+      if (Date.now() - changedAt < TIME_ZONE_CHANGE_COOLDOWN_MS) return current;
+
+      transaction.set(profileRef, {
+        timeZone: candidate,
+        timeZoneUpdatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
       return candidate;
     });
-  }
-
-  async verifyTransaction(signedTransaction) {
-    let lastError;
-    for (const verifier of this.appleVerifiers) {
-      try {
-        return await verifier.verifyAndDecodeTransaction(signedTransaction);
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw billingError(
-      400,
-      `The App Store transaction could not be verified${lastError ? `: ${lastError.message}` : "."}`
-    );
-  }
-
-  async verifyNotification(signedPayload) {
-    let lastError;
-    for (const verifier of this.appleVerifiers) {
-      try {
-        return {
-          verifier,
-          notification: await verifier.verifyAndDecodeNotification(signedPayload),
-        };
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw billingError(
-      400,
-      `The App Store notification could not be verified${lastError ? `: ${lastError.message}` : "."}`
-    );
-  }
-
-  async bindTransaction(uid, transaction, options = {}) {
-    const originalTransactionId = transaction.originalTransactionId;
-    const expiresAt = Number(transaction.expiresDate || 0);
-    const active =
-      transaction.revocationDate == null
-      && expiresAt > Date.now();
-
-    if (!this.firebase.hasAdminCredentials) {
-      this.memory.bindTransaction(uid, originalTransactionId, active, expiresAt);
-      return;
-    }
-
-    const bindingRef = this.firebase.firestore.doc(
-      `appleTransactions/${originalTransactionId}`
-    );
-    const billingRef = this.firebase.firestore.doc(`billing/${uid}`);
-    await this.firebase.firestore.runTransaction(async (firestoreTransaction) => {
-      const bindingSnapshot = await firestoreTransaction.get(bindingRef);
-      const existingUID = bindingSnapshot.data()?.uid;
-      if (existingUID && existingUID !== uid) {
-        throw billingError(
-          409,
-          "This App Store subscription is already connected to another CookLens account."
-        );
-      }
-      if (!existingUID || options.allowExistingBinding) {
-        firestoreTransaction.set(
-          bindingRef,
-          {
-            uid,
-            productID: transaction.productId,
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
-      firestoreTransaction.set(
-        billingRef,
-        {
-          tier: active ? "premium" : "free",
-          status: active ? "active" : "expired",
-          productID: transaction.productId,
-          originalTransactionID: originalTransactionId,
-          expiresAt: expiresAt ? Timestamp.fromMillis(expiresAt) : null,
-          environment: transaction.environment || null,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    });
-  }
-
-  async transactionBinding(originalTransactionId) {
-    if (!this.firebase.hasAdminCredentials) {
-      return this.memory.transactionBinding(originalTransactionId);
-    }
-    const snapshot = await this.firebase.firestore
-      .doc(`appleTransactions/${originalTransactionId}`)
-      .get();
-    return snapshot.data() || null;
   }
 }
 
@@ -281,51 +200,39 @@ class FirestoreBillingStore {
     this.firestore = firestore;
   }
 
-  async status(uid, tier, timeZone) {
+  async status(uid, timeZone) {
     const now = new Date();
     const dateKey = localDateKey(now, timeZone);
     const snapshot = await this.firestore
       .doc(`imageUsage/${uid}/days/${dateKey}`)
       .get();
-    const usedCount = Number(snapshot.data()?.usedCount || 0);
-    const dailyLimit = limitForTier(tier);
-    return statusPayload(tier, dailyLimit, usedCount, timeZone, now);
+    return statusPayload(Number(snapshot.data()?.usedCount || 0), timeZone, now);
   }
 
-  async reserve(uid, tier, timeZone) {
+  async reserve(uid, timeZone) {
     const now = new Date();
     const dateKey = localDateKey(now, timeZone);
     const dailyRef = this.firestore.doc(`imageUsage/${uid}/days/${dateKey}`);
-    const reservationID = crypto.randomUUID();
+    const reservationID = randomUUID();
 
     await this.firestore.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(dailyRef);
       const data = snapshot.data() || {};
       const usedCount = Number(data.usedCount || 0);
       const reservations = activeReservations(data.reservations, now.getTime());
-      const dailyLimit = limitForTier(tier);
-
-      if (usedCount + Object.keys(reservations).length >= dailyLimit) {
-        throw quotaError(
-          statusPayload(tier, dailyLimit, usedCount, timeZone, now)
-        );
+      if (usedCount + Object.keys(reservations).length >= DAILY_IMAGE_LIMIT) {
+        throw quotaError(statusPayload(usedCount, timeZone, now));
       }
-
       reservations[reservationID] = now.toISOString();
-      transaction.set(
-        dailyRef,
-        {
-          tier,
-          timeZone,
-          usedCount,
-          reservations,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+      transaction.set(dailyRef, {
+        timeZone,
+        usedCount,
+        reservations,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
     });
 
-    return { uid, tier, timeZone, dateKey, reservationID };
+    return { uid, timeZone, dateKey, reservationID };
   }
 
   async finish(reservation, success, costUSD) {
@@ -336,18 +243,16 @@ class FirestoreBillingStore {
       const snapshot = await transaction.get(dailyRef);
       const data = snapshot.data() || {};
       const reservations = { ...(data.reservations || {}) };
-      if (!reservations[reservation.reservationID]) {
-        return;
-      }
+      if (!reservations[reservation.reservationID]) return;
       delete reservations[reservation.reservationID];
-
       const update = {
         reservations,
         updatedAt: FieldValue.serverTimestamp(),
       };
       if (success) {
         update.usedCount = Number(data.usedCount || 0) + 1;
-        update.successfulCostUSD = Number(data.successfulCostUSD || 0) + Number(costUSD || 0);
+        update.successfulCostUSD =
+          Number(data.successfulCostUSD || 0) + Number(costUSD || 0);
       }
       transaction.set(dailyRef, update, { merge: true });
     });
@@ -357,14 +262,15 @@ class FirestoreBillingStore {
 class MemoryBillingStore {
   constructor() {
     this.users = new Map();
-    this.bindings = new Map();
+  }
+
+  deleteUser(uid) {
+    this.users.delete(uid);
   }
 
   user(uid) {
     if (!this.users.has(uid)) {
       this.users.set(uid, {
-        tier: "free",
-        expiresAt: null,
         timeZone: "UTC",
         timeZoneUpdatedAt: 0,
         days: new Map(),
@@ -373,17 +279,9 @@ class MemoryBillingStore {
     return this.users.get(uid);
   }
 
-  entitlement(uid) {
-    const user = this.user(uid);
-    const active = user.tier === "premium" && user.expiresAt > Date.now();
-    return { tier: active ? "premium" : "free", expiresAt: user.expiresAt };
-  }
-
   resolveTimeZone(uid, candidate) {
     const user = this.user(uid);
-    if (user.timeZone === candidate) {
-      return candidate;
-    }
+    if (user.timeZone === candidate) return candidate;
     if (Date.now() - user.timeZoneUpdatedAt < TIME_ZONE_CHANGE_COOLDOWN_MS) {
       return user.timeZone;
     }
@@ -392,55 +290,36 @@ class MemoryBillingStore {
     return candidate;
   }
 
-  status(uid, tier, timeZone) {
+  status(uid, timeZone) {
     const now = new Date();
-    const day = this.day(uid, localDateKey(now, timeZone));
-    return statusPayload(tier, limitForTier(tier), day.usedCount, timeZone, now);
+    return statusPayload(
+      this.day(uid, localDateKey(now, timeZone)).usedCount,
+      timeZone,
+      now
+    );
   }
 
-  reserve(uid, tier, timeZone) {
+  reserve(uid, timeZone) {
     const now = new Date();
     const dateKey = localDateKey(now, timeZone);
     const day = this.day(uid, dateKey);
     day.reservations = activeReservations(day.reservations, now.getTime());
-    const dailyLimit = limitForTier(tier);
-    if (day.usedCount + Object.keys(day.reservations).length >= dailyLimit) {
-      throw quotaError(statusPayload(tier, dailyLimit, day.usedCount, timeZone, now));
+    if (day.usedCount + Object.keys(day.reservations).length >= DAILY_IMAGE_LIMIT) {
+      throw quotaError(statusPayload(day.usedCount, timeZone, now));
     }
-    const reservationID = crypto.randomUUID();
+    const reservationID = randomUUID();
     day.reservations[reservationID] = now.toISOString();
-    return { uid, tier, timeZone, dateKey, reservationID };
+    return { uid, timeZone, dateKey, reservationID };
   }
 
   finish(reservation, success, costUSD) {
     const day = this.day(reservation.uid, reservation.dateKey);
-    if (!day.reservations[reservation.reservationID]) {
-      return;
-    }
+    if (!day.reservations[reservation.reservationID]) return;
     delete day.reservations[reservation.reservationID];
     if (success) {
       day.usedCount += 1;
       day.successfulCostUSD += Number(costUSD || 0);
     }
-  }
-
-  bindTransaction(uid, originalTransactionId, active, expiresAt) {
-    const existingUID = this.bindings.get(originalTransactionId);
-    if (existingUID && existingUID !== uid) {
-      throw billingError(
-        409,
-        "This App Store subscription is already connected to another CookLens account."
-      );
-    }
-    this.bindings.set(originalTransactionId, uid);
-    const user = this.user(uid);
-    user.tier = active ? "premium" : "free";
-    user.expiresAt = expiresAt;
-  }
-
-  transactionBinding(originalTransactionId) {
-    const uid = this.bindings.get(originalTransactionId);
-    return uid ? { uid } : null;
   }
 
   day(uid, dateKey) {
@@ -471,41 +350,45 @@ function initializeFirebase(config) {
   const app = getApps()[0] || initializeApp({
     credential,
     projectId: config.firebaseProjectID,
+    storageBucket:
+      process.env.FIREBASE_STORAGE_BUCKET
+      || `${config.firebaseProjectID}.firebasestorage.app`,
   });
   return {
     auth: getAuth(app),
+    appCheck: getAppCheck(app),
     firestore: getFirestore(app),
+    storage: getStorage(app),
     hasAdminCredentials,
   };
 }
 
-function createAppleVerifiers(config) {
-  if (!config.appleRootCADirectory) {
-    return [];
+async function deleteDocumentTree(firestore, path) {
+  const reference = firestore.doc(path);
+  try {
+    await firestore.recursiveDelete(reference);
+  } catch (error) {
+    if (error?.code !== 5) throw error;
   }
+}
 
-  const roots = readdirSync(config.appleRootCADirectory)
-    .filter((name) => name.endsWith(".cer"))
-    .map((name) => readFileSync(join(config.appleRootCADirectory, name)));
-  if (roots.length === 0) {
-    return [];
+async function deleteLegacyTransactions(firestore, uid) {
+  const snapshot = await firestore
+    .collection("appleTransactions")
+    .where("uid", "==", uid)
+    .get();
+  if (snapshot.empty) return;
+  const batch = firestore.batch();
+  for (const document of snapshot.docs) batch.delete(document.ref);
+  await batch.commit();
+}
+
+async function deleteStoragePrefix(storage, prefix) {
+  try {
+    await storage.bucket().deleteFiles({ prefix, force: true });
+  } catch (error) {
+    if (error?.code !== 404) throw error;
   }
-
-  return [
-    new SignedDataVerifier(
-      roots,
-      true,
-      Environment.PRODUCTION,
-      config.bundleID,
-      config.appAppleID || undefined
-    ),
-    new SignedDataVerifier(
-      roots,
-      true,
-      Environment.SANDBOX,
-      config.bundleID
-    ),
-  ];
 }
 
 function activeReservations(value, nowMillis) {
@@ -519,55 +402,40 @@ function activeReservations(value, nowMillis) {
   return reservations;
 }
 
-function limitForTier(tier) {
-  return tier === "premium" ? 10 : 1;
-}
-
-function statusPayload(tier, dailyLimit, usedCount, timeZone, now) {
+function statusPayload(usedCount, timeZone, now) {
   return {
-    tier,
-    dailyLimit,
-    remainingToday: Math.max(0, dailyLimit - usedCount),
+    dailyLimit: DAILY_IMAGE_LIMIT,
+    remainingToday: Math.max(0, DAILY_IMAGE_LIMIT - usedCount),
     resetAt: nextLocalMidnight(now, timeZone).toISOString(),
   };
 }
 
 function quotaError(status) {
-  const error = billingError(
+  const error = serviceError(
     429,
-    status.tier === "premium"
-      ? "You have used today’s Premium picture allowance."
-      : "Your free picture for today has already been used.",
+    `You have used today’s ${DAILY_IMAGE_LIMIT} AI dish photos.`,
     "image_quota_exceeded"
   );
   error.details = status;
   return error;
 }
 
-function billingError(statusCode, message, code = null) {
+export function serviceError(statusCode, message, code = null) {
   const error = new Error(message);
   error.statusCode = statusCode;
-  if (code) {
-    error.code = code;
-  }
+  if (code) error.code = code;
   return error;
 }
 
 function timestampMillis(value) {
-  if (!value) {
-    return null;
-  }
-  if (typeof value.toMillis === "function") {
-    return value.toMillis();
-  }
+  if (!value) return null;
+  if (typeof value.toMillis === "function") return value.toMillis();
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
 export function validTimeZone(value) {
-  if (typeof value !== "string" || !value.trim()) {
-    return false;
-  }
+  if (typeof value !== "string" || !value.trim()) return false;
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
     return true;
@@ -591,12 +459,10 @@ export function nextLocalMidnight(date, timeZone) {
   const currentKey = localDateKey(date, timeZone);
   let lower = date.getTime();
   let upper = lower + 60 * 60 * 1000;
-
   while (localDateKey(new Date(upper), timeZone) === currentKey) {
     lower = upper;
     upper += 60 * 60 * 1000;
   }
-
   while (upper - lower > 1000) {
     const midpoint = Math.floor((lower + upper) / 2);
     if (localDateKey(new Date(midpoint), timeZone) === currentKey) {
@@ -607,5 +473,3 @@ export function nextLocalMidnight(date, timeZone) {
   }
   return new Date(upper);
 }
-
-export { PREMIUM_PRODUCT_ID };

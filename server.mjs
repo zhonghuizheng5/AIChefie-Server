@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Bonjour } from "bonjour-service";
 import { BillingService } from "./billing.mjs";
+import { RateLimitService } from "./rate-limit.mjs";
 import {
   applyServerSafetyGuidance,
   buildNoteCompatibilityPrompt,
@@ -41,8 +42,8 @@ const primaryImageModel =
   || process.env.OPENROUTER_IMAGE_MODEL
   || "bytedance-seed/seedream-4.5";
 
-const serverVersion = "0.3.0";
-const apiVersion = 4;
+const serverVersion = "0.4.0";
+const apiVersion = 5;
 const supportedRecipeCounts = [1, 2, 3];
 
 const config = {
@@ -61,17 +62,21 @@ const config = {
   fallbackImageModel:
     process.env.OPENROUTER_FALLBACK_IMAGE_MODEL
     || primaryImageModel,
-  premiumImageModel:
-    process.env.OPENROUTER_PREMIUM_IMAGE_MODEL
-    || "openai/gpt-5-image-mini",
   firebaseProjectID: process.env.FIREBASE_PROJECT_ID || "cooklens-ef35c",
-  bundleID: process.env.APPLE_BUNDLE_ID || "com.zhonghuizheng.CookLens",
-  appAppleID: process.env.APPLE_APP_ID ? Number(process.env.APPLE_APP_ID) : null,
-  appleRootCADirectory: process.env.APPLE_ROOT_CA_DIRECTORY || null,
+  production:
+    process.env.NODE_ENV === "production"
+    || Boolean(process.env.RAILWAY_ENVIRONMENT),
 };
 const billing = new BillingService(config);
+const rateLimits = new RateLimitService({
+  firestore: billing.firebase.hasAdminCredentials
+    ? billing.firebase.firestore
+    : null,
+  production: config.production,
+  secret: process.env.RATE_LIMIT_HASH_SECRET,
+});
 
-const bonjour = new Bonjour();
+const bonjour = config.production ? null : new Bonjour();
 const requestContext = new AsyncLocalStorage();
 let bonjourService;
 
@@ -95,11 +100,17 @@ const server = createServer((request, response) => {
     }
   });
 
-  requestContext.run({ requestID }, () => {
+  requestContext.run({
+    requestID,
+    startedAt: Date.now(),
+    endpoint: request.url?.split("?")[0] || "/",
+    hashedUserID: null,
+  }, () => {
     handleRequest(request, response).catch((error) => {
-      console.error("CookLens request handler failed unexpectedly", {
+      console.error("request_failed", {
         requestID,
-        message: error.message || String(error),
+        endpoint: request.url?.split("?")[0] || "/",
+        status: 500,
       });
       if (!response.headersSent) {
         sendJSON(response, 500, { error: "Unexpected server error" });
@@ -113,39 +124,56 @@ const server = createServer((request, response) => {
 async function handleRequest(request, response) {
   const startedAt = Date.now();
   const requestID = currentRequestID();
+  const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  const endpoint = url.pathname;
 
   try {
-    console.log(`${new Date().toISOString()} ${request.method} ${request.url}`, {
-      requestID,
-    });
-
-    if (request.method === "GET" && request.url === "/health") {
-      sendJSON(response, 200, {
+    if (request.method === "GET" && endpoint === "/health") {
+      const health = {
         ok: true,
         configured: Boolean(config.apiKey),
+        serverVersion,
+        apiVersion,
         supportedRecipeCounts,
-        analysisModel: config.analysisModel,
-        recipeModel: config.recipeModel,
-        reviewModel: config.reviewModel,
-        secondOpinionModel: config.secondOpinionModel,
-        imageModel: config.primaryImageModel,
-        primaryImageModel: config.primaryImageModel,
-        fallbackImageModel: config.fallbackImageModel,
-        premiumImageModel: config.premiumImageModel,
-        simulatorURL: `http://127.0.0.1:${config.port}`,
-        phoneURLs: localNetworkURLs(),
-      });
+      };
+      if (!config.production) {
+        Object.assign(health, {
+          analysisModel: config.analysisModel,
+          recipeModel: config.recipeModel,
+          reviewModel: config.reviewModel,
+          secondOpinionModel: config.secondOpinionModel,
+          primaryImageModel: config.primaryImageModel,
+          fallbackImageModel: config.fallbackImageModel,
+          simulatorURL: `http://127.0.0.1:${config.port}`,
+          phoneURLs: localNetworkURLs(),
+        });
+      }
+      sendJSON(response, 200, health);
       return;
     }
 
-    if (request.method === "GET" && request.url?.startsWith("/api/subscription/status")) {
-      const user = await billing.authenticate(request);
-      const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    if (!endpoint.startsWith("/api/")) {
+      sendJSON(response, 404, { error: "Not found" });
+      return;
+    }
+
+    const user = await billing.authenticate(request);
+    const context = requestContext.getStore();
+    if (context) context.hashedUserID = rateLimits.hash(`log:${user.uid}`);
+    const clientIP = clientIPAddress(request);
+
+    if (request.method === "GET" && endpoint === "/api/quota/status") {
       sendJSON(
         response,
         200,
         await billing.status(user.uid, url.searchParams.get("timeZone"))
       );
+      return;
+    }
+
+    if (request.method === "DELETE" && endpoint === "/api/account") {
+      await billing.deleteAccount(user);
+      sendJSON(response, 200, { ok: true });
       return;
     }
 
@@ -156,47 +184,47 @@ async function handleRequest(request, response) {
 
     const body = await readJSONBody(request);
 
-    if (request.url === "/api/app-store-notifications") {
-      sendJSON(response, 200, await billing.processNotification(body.signedPayload));
-      return;
-    }
-
-    if (request.url === "/api/subscription/sync") {
-      const user = await billing.authenticate(request);
-      sendJSON(
-        response,
-        200,
-        await billing.syncSignedTransaction(
-          user.uid,
-          body.signedTransaction,
-          body.timeZone
-        )
+    if (endpoint === "/api/account/merge-anonymous") {
+      const anonymousUID = await billing.verifyAnonymousIDToken(
+        requiredString(body.anonymousIDToken, "anonymousIDToken"),
+        user.uid
       );
+      await billing.deleteObsoleteAnonymousAccount(anonymousUID);
+      sendJSON(response, 200, { ok: true });
       return;
     }
 
     if (!config.apiKey) {
       sendJSON(response, 500, {
-        error: "Missing OPENROUTER_API_KEY in CookLensServer/.env",
+        error: "The AI service is not configured.",
+        code: "service_unavailable",
       });
       return;
     }
 
-    if (request.url === "/api/analyze") {
+    if (
+      endpoint === "/api/analyze"
+      || endpoint === "/api/recipes"
+      || endpoint === "/api/generate"
+    ) {
+      await rateLimits.consume("ai", { uid: user.uid, ip: clientIP });
+    }
+
+    if (endpoint === "/api/analyze") {
       sendJSON(response, 200, await analyzeIngredients(body));
       return;
     }
 
-    if (request.url === "/api/recipes") {
+    if (endpoint === "/api/recipes") {
       sendJSON(response, 200, await generateRecipes(body));
       return;
     }
 
-    if (request.url === "/api/dish-image") {
-      const user = await billing.authenticate(request);
+    if (endpoint === "/api/dish-image") {
+      await rateLimits.consume("image", { uid: user.uid, ip: clientIP });
       const reservation = await billing.reserveImage(user.uid, body.timeZone);
       try {
-        const result = await generateDishImage(body, reservation.tier);
+        const result = await generateDishImage(body);
         const costUSD =
           result.source?.reportedCostUSD
           ?? result.source?.estimatedCostUSD
@@ -215,13 +243,13 @@ async function handleRequest(request, response) {
       return;
     }
 
-    if (request.url === "/api/generate") {
-      const user = await billing.authenticate(request);
+    if (endpoint === "/api/generate") {
       const recipeResult = await generateRecipes(body);
       const recipes = await Promise.all(
         recipeResult.recipes.map(async (recipe) => {
           let reservation;
           try {
+            await rateLimits.consume("image", { uid: user.uid, ip: clientIP });
             reservation = await billing.reserveImage(user.uid, body.timeZone);
             const image = await generateDishImage({
               dishName: recipe.dishName,
@@ -233,7 +261,7 @@ async function handleRequest(request, response) {
               finalPresentation: recipe.finalPresentation,
               cuisineInfluence: recipe.cuisineInfluence,
               cuisineMatch: recipe.cuisineMatch,
-            }, reservation.tier);
+            });
             const costUSD =
               image.source?.reportedCostUSD
               ?? image.source?.estimatedCostUSD
@@ -281,11 +309,13 @@ async function handleRequest(request, response) {
 
     sendJSON(response, 404, { error: "Not found" });
   } catch (error) {
-    console.error(`${new Date().toISOString()} ${request.method} ${request.url} failed`, {
+    console.error("request_failed", {
       requestID,
+      endpoint,
+      status: error.statusCode || 500,
       durationMs: Date.now() - startedAt,
-      message: error.message || String(error),
       code: error.code || null,
+      hashedUserID: requestContext.getStore()?.hashedUserID || null,
     });
     sendJSON(response, error.statusCode || 500, {
       error: error.message || "Unexpected server error",
@@ -307,8 +337,12 @@ server.on("error", (error) => {
 });
 
 server.listen(config.port, () => {
-  const phoneURLs = localNetworkURLs();
+  if (config.production) {
+    console.log("server_started", { port: config.port, apiVersion });
+    return;
+  }
 
+  const phoneURLs = localNetworkURLs();
   bonjourService = bonjour.publish({
     name: "CookLens AI Server",
     type: "cooklens",
@@ -320,29 +354,39 @@ server.listen(config.port, () => {
       urls: phoneURLs.join(","),
     },
   });
-
-  console.log(`CookLens server listening for simulator: http://127.0.0.1:${config.port}`);
-  for (const url of phoneURLs) {
-    console.log(`CookLens server listening for real iPhone: ${url}`);
-  }
-  console.log(`CookLens Bonjour service published as _cooklens._tcp.local with URLs: ${phoneURLs.join(", ")}`);
+  console.log("development_server_started", {
+    port: config.port,
+    apiVersion,
+    phoneURLs,
+  });
 });
 
 process.on("unhandledRejection", (error) => {
-  console.error("Unhandled rejection:", error);
+  console.error("unhandled_rejection", {
+    status: 500,
+    code: error?.code || null,
+  });
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught exception:", error);
+  console.error("uncaught_exception", {
+    status: 500,
+    code: error?.code || null,
+  });
   process.exit(1);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
-    bonjourService?.stop(() => {
-      bonjour.destroy();
+    const close = () => {
+      bonjour?.destroy();
       server.close(() => process.exit(0));
-    });
+    };
+    if (bonjourService) {
+      bonjourService.stop(close);
+    } else {
+      close();
+    }
   });
 }
 
@@ -383,7 +427,7 @@ function loadEnv(filePath) {
 async function readJSONBody(request) {
   const chunks = [];
   let size = 0;
-  const maxSize = 12 * 1024 * 1024;
+  const maxSize = 4 * 1024 * 1024;
 
   for await (const chunk of request) {
     size += chunk.length;
@@ -406,16 +450,34 @@ async function readJSONBody(request) {
 
 function sendJSON(response, statusCode, payload) {
   const requestID = currentRequestID();
-  response.writeHead(statusCode, {
+  const headers = {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-  });
+  };
+  if (statusCode === 429 && Number(payload.retryAfter) > 0) {
+    headers["Retry-After"] = String(Math.ceil(Number(payload.retryAfter)));
+  }
+  response.writeHead(statusCode, headers);
   response.end(JSON.stringify({
     ...payload,
     serverVersion,
     apiVersion,
     ...(requestID ? { requestID } : {}),
   }));
+  const context = requestContext.getStore();
+  console.log("request_complete", {
+    requestID,
+    endpoint: context?.endpoint || null,
+    status: statusCode,
+    latency: context?.startedAt ? Date.now() - context.startedAt : null,
+    hashedUserID: context?.hashedUserID || null,
+  });
+}
+
+function clientIPAddress(request) {
+  const forwarded = String(request.headers["x-forwarded-for"] || "")
+    .split(",")[0]
+    .trim();
+  return forwarded || request.socket.remoteAddress || "unknown";
 }
 
 function currentRequestID() {
@@ -491,17 +553,6 @@ async function generateRecipes(input) {
     );
   }
 
-  console.log("CookLens generation input", {
-    confirmedPhotoIngredients,
-    confirmedIngredientDetails,
-    visiblePantryBasics,
-    savedPantrySeasonings,
-    pantrySeasonings,
-    notes,
-    recipeCount,
-    favoriteCuisineIDs: favoriteCuisines.map((cuisine) => cuisine.id),
-  });
-
   let noteCompatibility = null;
   if (notes) {
     noteCompatibility = await checkNoteCompatibility(
@@ -510,7 +561,6 @@ async function generateRecipes(input) {
       notes
     );
 
-    console.log("CookLens notes compatibility", noteCompatibility);
   }
 
   const baseRequest = {
@@ -531,10 +581,6 @@ async function generateRecipes(input) {
     // A wrong recipe count gets exactly one repair attempt; afterwards we
     // return a structured error instead of fabricating or cloning options.
     if (error?.code !== "recipe_count_mismatch") throw error;
-    console.warn("CookLens recipe count mismatch; repair attempt 1", {
-      recipeCount,
-      message: error.message,
-    });
     try {
       repairUsed = true;
       recipes = await requestRecipeOptions({
@@ -564,11 +610,6 @@ async function generateRecipes(input) {
   );
 
   if (!validation.valid && !repairUsed) {
-    console.warn("CookLens recipe validation failed; repair attempt 1", {
-      reason: validation.reason,
-      violations: validation.violations || validation.unapprovedIngredients,
-      recipes: recipeLogSummary(recipes),
-    });
     repairUsed = true;
     try {
       recipes = await requestRecipeOptions({
@@ -795,18 +836,6 @@ async function analyzeIngredients(input) {
   );
   const weakSceneClassification = scene.sceneConfidence < ingredientConfidenceThreshold;
 
-  console.log("CookLens ingredient analysis", {
-    ...scene,
-    detectedIngredients,
-    requiresConfirmation:
-      Boolean(parsed.requiresConfirmation)
-      || lowConfidence
-      || unknownState
-      || uncertainCategory
-      || scene.sceneType === "unclear"
-      || weakSceneClassification,
-  });
-
   return {
     ...scene,
     detectedIngredients,
@@ -916,6 +945,7 @@ async function validateRecipeSet(
     "The separate pairingSuggestion may mention another food, but that food must not appear anywhere else.",
     "cuisineInfluence must be one of the selected favorite cuisines, or null for a neutral recipe.",
     "cuisineMatch must be traditional, inspired, or neutral.",
+    "dishName must not repeat the displayed cuisine label implied by cuisineInfluence and cuisineMatch.",
     "Use traditional only when the available ingredients and technique honestly support that claim. Otherwise require inspired or neutral.",
     "Do not accept an unrequested cuisine or a misleading traditional dish name.",
     "Cooking-style and dish-format words are not ingredients. Do not reject salad, soup, bowl, roasted, grilled, stir-fry, braised, glazed, spicy, crispy, or similar words unless the recipe actually introduces a concrete unapproved food.",
@@ -968,7 +998,7 @@ function recipeLogSummary(recipes) {
   }));
 }
 
-async function generateDishImage(input, tier = "free") {
+async function generateDishImage(input) {
   const dishName = requiredString(input.dishName, "dishName");
   const detectedIngredients = normalizeStringArray(input.detectedIngredients);
   const unusedIngredients = normalizeStringArray(input.unusedIngredients);
@@ -995,11 +1025,9 @@ async function generateDishImage(input, tier = "free") {
   const result = await generateValidatedImage({
     maxAttempts: 2,
     generateImage: async (retryViolations, attempt) => {
-      const model = tier === "premium"
-        ? config.premiumImageModel
-        : attempt === 1
-          ? config.primaryImageModel
-          : config.fallbackImageModel;
+      const model = attempt === 1
+        ? config.primaryImageModel
+        : config.fallbackImageModel;
       const prompt = buildImagePrompt({
         recipe,
         approvedPhotoIngredients: detectedIngredients,
@@ -1052,13 +1080,6 @@ async function generateDishImage(input, tier = "free") {
   });
   const telemetry = summarizeImageGeneration(result.records);
 
-  console.log("CookLens image generation", {
-    dishName,
-    success: Boolean(result.imageDataURL),
-    attempts: result.attempts,
-    ...telemetry,
-  });
-
   return {
     imageDataURL: result.imageDataURL,
     imageError: result.imageError,
@@ -1067,7 +1088,6 @@ async function generateDishImage(input, tier = "free") {
       imageModel: result.records.at(-1)?.model || config.primaryImageModel,
       primaryImageModel: config.primaryImageModel,
       fallbackImageModel: config.fallbackImageModel,
-      premiumImageModel: config.premiumImageModel,
       reviewModel: config.reviewModel,
       secondOpinionModel: config.secondOpinionModel,
       modelsUsed: result.records.map((record) => record.model).filter(Boolean),
@@ -1205,27 +1225,19 @@ async function callOpenRouterChat(payload, telemetry = {}) {
       throw httpError(response.status, openRouterErrorMessage(json));
     }
 
-    console.log("CookLens OpenRouter request", {
+    console.log("model_request_complete", {
       requestID,
-      stage: telemetry.stage || "chat",
-      attempt: telemetry.attempt || 1,
       model: payload.model,
-      durationMs: Date.now() - startedAt,
-      finishReason:
-        json.choices?.[0]?.finish_reason
-        || json.choices?.[0]?.native_finish_reason
-        || null,
-      reportedCostUSD: openRouterUsageCost(json),
+      latency: Date.now() - startedAt,
+      cost: openRouterUsageCost(json),
     });
     return json;
   } catch (error) {
-    console.error("CookLens OpenRouter request failed", {
+    console.error("model_request_failed", {
       requestID,
-      stage: telemetry.stage || "chat",
-      attempt: telemetry.attempt || 1,
       model: payload.model,
-      durationMs: Date.now() - startedAt,
-      message: error.message || String(error),
+      latency: Date.now() - startedAt,
+      cost: null,
     });
     throw error;
   }
@@ -1262,13 +1274,6 @@ async function callOpenRouterStructured({
       return parseJSONFromOpenRouter(response, stage);
     } catch (error) {
       lastError = error;
-      const choice = response.choices?.[0];
-      console.warn(`CookLens ${stage} returned invalid structured data`, {
-        attempt,
-        finishReason: choice?.finish_reason || choice?.native_finish_reason || null,
-        contentPreview: openRouterContentText(choice?.message?.content).slice(0, 240),
-        message: error.message,
-      });
     }
   }
 
